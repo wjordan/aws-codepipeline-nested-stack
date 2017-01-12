@@ -1,0 +1,204 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: Infrastructure Continuous Delivery with CodePipeline and CloudFormation, with a project containing a nested stack.
+Parameters:
+  ArtifactBucket:
+    Type: String
+    Description: Name of existing S3 bucket for storing pipeline artifacts
+  StackFilename:
+    Type: String
+    Default: cfn-template.yml
+    Description: CloudFormation stack template filename in the Git repo
+  GitHubOwner:
+    Type: String
+    Description: GitHub repository owner
+  GitHubRepo:
+    Type: String
+    Default: aws-codepipeline-nested-stack
+    Description: GitHub repository name
+  GitHubBranch:
+    Type: String
+    Default: master
+    Description: GitHub repository branch
+  GitHubToken:
+    Type: String
+    Description: GitHub repository OAuth token
+  NestedStackFilename:
+    Type: String
+    Description: GitHub filename (and S3 Object Key) for nested stack template.
+    Default: nested.yml
+Resources:
+  Pipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      RoleArn: !GetAtt [PipelineRole, Arn]
+      ArtifactStore: 
+        Type: S3
+        Location: !Ref ArtifactBucket
+      Stages:
+      - Name: Source
+        Actions:
+        - Name: Source
+          ActionTypeId:
+            Category: Source
+            Owner: ThirdParty
+            Version: 1
+            Provider: GitHub
+          Configuration:
+            Owner: !Ref GitHubOwner
+            Repo: !Ref GitHubRepo
+            Branch: !Ref GitHubBranch
+            OAuthToken: !Ref GitHubToken
+          OutputArtifacts: [Name: Template]
+          RunOrder: 1
+      - Name: Deploy
+        Actions:
+        - Name: S3Upload
+          ActionTypeId:
+            Category: Invoke
+            Owner: AWS
+            Provider: Lambda
+            Version: 1
+          InputArtifacts: [Name: Template]
+          Configuration:
+            FunctionName: !Ref S3UploadObject
+            UserParameters: !Ref NestedStackFilename
+          RunOrder: 1
+        - Name: Deploy
+          RunOrder: 2
+          ActionTypeId:
+            Category: Deploy
+            Owner: AWS
+            Version: 1
+            Provider: CloudFormation
+          InputArtifacts: [Name: Template]
+          Configuration:
+            ActionMode: REPLACE_ON_FAILURE
+            RoleArn: !GetAtt [CFNRole, Arn]
+            StackName: !Ref AWS::StackName
+            TemplatePath: !Sub "Template::${StackFilename}"
+            Capabilities: CAPABILITY_IAM
+            ParameterOverrides: !Sub |
+              {
+                "ArtifactBucket": "${ArtifactBucket}",
+                "StackFilename": "${StackFilename}",
+                "GitHubOwner": "${GitHubOwner}",
+                "GitHubRepo": "${GitHubRepo}",
+                "GitHubBranch": "${GitHubBranch}",
+                "GitHubToken": "${GitHubToken}",
+                "NestedStackFilename": "${NestedStackFilename}"
+              }
+  CFNRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+        - Action: ['sts:AssumeRole']
+          Effect: Allow
+          Principal: {Service: [cloudformation.amazonaws.com]}
+        Version: '2012-10-17'
+      Path: /
+      ManagedPolicyArns:
+      # TODO grant least privilege to only allow managing your CloudFormation stack resources
+      - "arn:aws:iam::aws:policy/AdministratorAccess"
+  PipelineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+        - Action: ['sts:AssumeRole']
+          Effect: Allow
+          Principal: {Service: [codepipeline.amazonaws.com]}
+        Version: '2012-10-17'
+      Path: /
+      Policies:
+        - PolicyName: CodePipelineAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Action:
+                - 's3:*'
+                - 'cloudformation:*'
+                - 'iam:PassRole'
+                - 'lambda:*'
+                Effect: Allow
+                Resource: '*'
+  Dummy:
+    Type: AWS::CloudFormation::WaitConditionHandle
+  NestedStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: !Sub "https://s3.amazonaws.com/${ArtifactBucket}/${NestedStackFilename}"
+  S3UploadObject:
+    Type: AWS::Lambda::Function
+    Properties:
+      Description: Extracts and uploads the specified InputArtifact file to S3.
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        ZipFile: !Sub |
+          var exec = require('child_process').exec;
+          var AWS = require('aws-sdk');
+          var codePipeline = new AWS.CodePipeline();
+          exports.handler = function(event, context, callback) {
+            var job = event["CodePipeline.job"];
+            var s3Download = new AWS.S3({
+                credentials: job.data.artifactCredentials,
+                signatureVersion: 'v4'
+            });
+            var s3Upload = new AWS.S3({
+                signatureVersion: 'v4'
+            });
+            var jobId = job.id;
+            function respond(e) {
+              var params = {jobId: jobId};
+              if (e) {
+                params['failureDetails'] = {
+                  message: JSON.stringify(e),
+                  type: 'JobFailed',
+                  externalExecutionId: context.invokeid
+                };
+                codePipeline.putJobFailureResult(params, (err, data) => callback(e));
+              } else {
+                codePipeline.putJobSuccessResult(params, (err, data) => callback(e));
+              }
+            }
+            var filename = job.data.actionConfiguration.configuration.UserParameters;
+            var location = job.data.inputArtifacts[0].location.s3Location;
+            var bucket = location.bucketName;
+            var key = location.objectKey;
+            var tmpFile = '/tmp/file.zip';
+            s3Download.getObject({Bucket: bucket, Key: key})
+              .createReadStream()
+              .pipe(require('fs').createWriteStream(tmpFile))
+              .on('finish', ()=>{
+                exec(`unzip -p ${!tmpFile} ${!filename}`, (err, stdout)=>{
+                if (err) { respond(err); }
+                s3Upload.putObject({Bucket: bucket, Key: filename, Body: stdout}, (err, data) => respond(err));
+              });
+            });
+          };
+      Timeout: 30
+      Runtime: nodejs4.3
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal: {Service: [lambda.amazonaws.com]}
+          Action: ['sts:AssumeRole']
+      Path: /
+      ManagedPolicyArns:
+      - "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+      - "arn:aws:iam::aws:policy/AWSCodePipelineCustomActionAccess"
+      Policies:
+      - PolicyName: S3Policy
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action:
+                - 's3:PutObject'
+                - 's3:PutObjectAcl'
+              Resource: !Sub "arn:aws:s3:::${ArtifactBucket}/${NestedStackFilename}"

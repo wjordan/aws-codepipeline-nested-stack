@@ -1,0 +1,10 @@
+#!/bin/sh
+#
+#  .git/hooks/pre-commit
+#
+
+aws cloudformation package \
+  --template-file ./template.yml \
+  --s3-bucket cfn-templates
+  --output-template-file template-package.yml
+git add template-package.yml
